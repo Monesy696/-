@@ -1,0 +1,19 @@
+﻿check,value,unit
+continuous_endpoint,183920.7786243122,s
+continuous_endpoint,51.08910517342005,h
+strict_60s_endpoint,183960.0,s
+endpoint_radius,1.2,cm
+maximum_moisture_before_strict,0.15001067055839332,kg/kg
+maximum_moisture_at_strict,0.14997986606027247,kg/kg
+endpoint_control_material_coordinate,0.0,1
+maximum_radial_moisture_increment,4.440892098500626e-16,kg/kg
+cumulative_moisture_balance_relative,0.0002098270422551054,1
+cumulative_moisture_balance_final,0.000510075232619922,kg/kg
+radius_node_interpolation_error,0.0,m
+maximum_radius_increment,0.0,m
+fixed_radius_rate_max_difference,0.0,state/s
+uniform_field_rhs_max,0.0,state/s
+minimum_density,764.7356877521675,kg/m3
+minimum_heat_capacity,1957.475112164655,J/(kg K)
+minimum_conductivity,0.12999768485252605,W/(m K)
+minimum_diffusivity,9.397127142124637e-12,m2/s

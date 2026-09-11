@@ -1,0 +1,2 @@
+﻿interval_count,primary_method,check_method,bdf_endpoint_s,radau_endpoint_s,absolute_difference_s
+80,BDF,Radau,184030.9036382811,184030.99984871212,0.09621043101651594

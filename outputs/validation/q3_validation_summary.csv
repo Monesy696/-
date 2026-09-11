@@ -1,0 +1,10 @@
+﻿check,value,unit
+continuous_endpoint,206904.91345853487,s
+continuous_endpoint,57.47358707181524,h
+strict_60s_endpoint,206940.0,s
+maximum_moisture_before_strict,0.15000725753784228,kg/kg
+maximum_moisture_at_strict,0.14998978177155164,kg/kg
+endpoint_control_radius,0.0,cm
+maximum_radial_moisture_increment,1.3322676295501878e-15,kg/kg
+cumulative_moisture_balance_relative,9.494750343704083e-05,1
+cumulative_moisture_balance_final,0.00023031395291051027,kg/kg

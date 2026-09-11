@@ -3,22 +3,32 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from data_processing import boundary_values, interpolate_profiles
+from data_processing import boundary_values, interpolate_profiles, radius_values
 from model import (
     CP_Q1,
     H_M,
     H_T,
     INITIAL_MOISTURE,
     K_Q1,
+    LENGTH_M,
+    RADIUS_M,
     RHO_Q1,
     build_radial_grid,
     diffusivity_q1,
     harmonic_mean,
     q1_rhs,
+    q4_rhs,
+    radial_rate,
+    scale_material_grid,
     properties_q23,
+    properties_q4,
     q2_rhs,
     solve_q1,
     solve_q2,
+    solve_q3,
+    solve_q3_endpoint,
+    solve_q4,
+    solve_q4_endpoint,
 )
 
 
@@ -48,7 +58,7 @@ def thomas_solve(lower, diagonal, upper, right_hand_side):
 
 def assemble_operator(coefficient, capacity, transfer_coefficient, external_value, grid):
     radius, _, volume, face_area = grid
-    spacing = radius[1] - radius[0]
+    spacing = np.diff(radius)
     node_count = len(radius)
     interface = harmonic_mean(coefficient[:-1], coefficient[1:])
 
@@ -60,11 +70,11 @@ def assemble_operator(coefficient, capacity, transfer_coefficient, external_valu
     for index in range(node_count):
         divisor = capacity * volume[index]
         if index > 0:
-            conductance = face_area[index] * interface[index - 1] / spacing
+            conductance = face_area[index] * interface[index - 1] / spacing[index - 1]
             lower[index - 1] = conductance / divisor
             diagonal[index] -= conductance / divisor
         if index < node_count - 1:
-            conductance = face_area[index + 1] * interface[index] / spacing
+            conductance = face_area[index + 1] * interface[index] / spacing[index]
             upper[index] = conductance / divisor
             diagonal[index] -= conductance / divisor
         else:
@@ -371,3 +381,516 @@ def run_q2_validation(boundary, output_root=Path("outputs")):
     comparison.to_csv(validation_dir / "q2_bdf_radau_comparison.csv", index=False, encoding="utf-8-sig")
     summary.to_csv(validation_dir / "q2_validation_summary.csv", index=False, encoding="utf-8-sig")
     return finest, convergence, comparison, summary
+
+
+def cumulative_fixed_moisture_balance(solution, boundary):
+    time_s = solution["time_s"]
+    moisture = solution["moisture"]
+    _, _, volume, face_area = solution["grid"]
+    mean_moisture = moisture @ volume / volume.sum()
+    _, air_moisture = boundary_values(
+        time_s, boundary, long_term_mode=solution["long_term_mode"]
+    )
+    outward_rate = (
+        face_area[-1]
+        * H_M
+        * solution["mass_transfer_scale"]
+        * (moisture[:, -1] - air_moisture)
+        / volume.sum()
+    )
+    cumulative = np.zeros_like(time_s)
+    cumulative[1:] = np.cumsum(
+        0.5 * np.diff(time_s) * (outward_rate[:-1] + outward_rate[1:])
+    )
+    residual = mean_moisture - mean_moisture[0] + cumulative
+    relative = np.max(np.abs(residual)) / max(
+        abs(mean_moisture[0] - mean_moisture[-1]), 1e-12
+    )
+    return relative, residual[-1]
+
+
+def _endpoint_grid_frame(endpoints):
+    rows = []
+    previous = None
+    for interval_count in sorted(endpoints):
+        endpoint_s = endpoints[interval_count]["endpoint_s"]
+        rows.append(
+            {
+                "interval_count": interval_count,
+                "endpoint_s": endpoint_s,
+                "endpoint_h": endpoint_s / 3600.0,
+                "difference_from_previous_s": (
+                    np.nan if previous is None else endpoint_s - previous
+                ),
+            }
+        )
+        previous = endpoint_s
+    return pd.DataFrame(rows)
+
+
+def run_q3_validation(boundary, output_root=Path("outputs")):
+    validation_dir = output_root / "validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    endpoints = {
+        interval_count: solve_q3_endpoint(
+            boundary, interval_count=interval_count, max_step_s=300.0
+        )
+        for interval_count in [160, 320, 640]
+    }
+    convergence = _endpoint_grid_frame(endpoints)
+    finest_endpoint = endpoints[640]
+    solution = solve_q3(boundary, interval_count=640, endpoint=finest_endpoint)
+
+    radau = solve_q3_endpoint(
+        boundary, interval_count=160, method="Radau", max_step_s=300.0
+    )
+    comparison = pd.DataFrame(
+        [
+            {
+                "interval_count": 160,
+                "primary_method": "BDF",
+                "check_method": "Radau",
+                "bdf_endpoint_s": endpoints[160]["endpoint_s"],
+                "radau_endpoint_s": radau["endpoint_s"],
+                "absolute_difference_s": abs(
+                    endpoints[160]["endpoint_s"] - radau["endpoint_s"]
+                ),
+            }
+        ]
+    )
+    tightened = solve_q3_endpoint(
+        boundary,
+        interval_count=640,
+        max_step_s=150.0,
+        relative_tolerance=1e-8,
+        temperature_tolerance=1e-8,
+        moisture_tolerance=1e-10,
+    )
+    time_refinement = pd.DataFrame(
+        [
+            {
+                "interval_count": 640,
+                "baseline_endpoint_s": finest_endpoint["endpoint_s"],
+                "tightened_endpoint_s": tightened["endpoint_s"],
+                "absolute_difference_s": abs(
+                    finest_endpoint["endpoint_s"] - tightened["endpoint_s"]
+                ),
+            }
+        ]
+    )
+
+    sensitivity_rows = []
+    scenario_cache = {(1.0, 1.0): endpoints[160]}
+    for diffusivity_scale in [0.9, 1.0, 1.1]:
+        for mass_transfer_scale in [0.9, 1.0, 1.1]:
+            key = (diffusivity_scale, mass_transfer_scale)
+            if key not in scenario_cache:
+                scenario_cache[key] = solve_q3_endpoint(
+                    boundary,
+                    interval_count=160,
+                    max_step_s=300.0,
+                    diffusivity_scale=diffusivity_scale,
+                    mass_transfer_scale=mass_transfer_scale,
+                )
+            endpoint_s = scenario_cache[key]["endpoint_s"]
+            sensitivity_rows.append(
+                {
+                    "scenario": "D_h_grid",
+                    "diffusivity_scale": diffusivity_scale,
+                    "mass_transfer_scale": mass_transfer_scale,
+                    "long_term_boundary": "rounded_50_0.05",
+                    "endpoint_s": endpoint_s,
+                    "endpoint_h": endpoint_s / 3600.0,
+                }
+            )
+    last_boundary = solve_q3_endpoint(
+        boundary,
+        interval_count=160,
+        max_step_s=300.0,
+        long_term_mode="last",
+    )
+    sensitivity_rows.append(
+        {
+            "scenario": "last_boundary",
+            "diffusivity_scale": 1.0,
+            "mass_transfer_scale": 1.0,
+            "long_term_boundary": "hold_attachment_last",
+            "endpoint_s": last_boundary["endpoint_s"],
+            "endpoint_h": last_boundary["endpoint_s"] / 3600.0,
+        }
+    )
+    sensitivity = pd.DataFrame(sensitivity_rows)
+    baseline_s = endpoints[160]["endpoint_s"]
+    sensitivity["delta_from_baseline_h"] = (
+        sensitivity["endpoint_s"] - baseline_s
+    ) / 3600.0
+    d_elasticity = (
+        scenario_cache[(1.1, 1.0)]["endpoint_s"]
+        - scenario_cache[(0.9, 1.0)]["endpoint_s"]
+    ) / (0.2 * baseline_s)
+    h_elasticity = (
+        scenario_cache[(1.0, 1.1)]["endpoint_s"]
+        - scenario_cache[(1.0, 0.9)]["endpoint_s"]
+    ) / (0.2 * baseline_s)
+    sensitivity_summary = pd.DataFrame(
+        [
+            {"parameter": "diffusivity_scale", "local_elasticity": d_elasticity},
+            {"parameter": "mass_transfer_scale", "local_elasticity": h_elasticity},
+        ]
+    )
+
+    balance_relative, balance_final = cumulative_fixed_moisture_balance(
+        solution, boundary
+    )
+    max_before = np.max(solution["moisture"][-2])
+    max_strict = np.max(solution["moisture"][-1])
+    endpoint_index = int(np.argmax(solution["endpoint_moisture"]))
+    radial_increment = np.max(np.diff(solution["moisture"], axis=1))
+    summary = pd.DataFrame(
+        [
+            {"check": "continuous_endpoint", "value": solution["endpoint_s"], "unit": "s"},
+            {"check": "continuous_endpoint", "value": solution["endpoint_s"] / 3600.0, "unit": "h"},
+            {"check": "strict_60s_endpoint", "value": solution["strict_output_s"], "unit": "s"},
+            {"check": "maximum_moisture_before_strict", "value": max_before, "unit": "kg/kg"},
+            {"check": "maximum_moisture_at_strict", "value": max_strict, "unit": "kg/kg"},
+            {"check": "endpoint_control_radius", "value": solution["radius_m"][endpoint_index] * 100.0, "unit": "cm"},
+            {"check": "maximum_radial_moisture_increment", "value": radial_increment, "unit": "kg/kg"},
+            {"check": "cumulative_moisture_balance_relative", "value": balance_relative, "unit": "1"},
+            {"check": "cumulative_moisture_balance_final", "value": balance_final, "unit": "kg/kg"},
+        ]
+    )
+
+    finest_grid_difference = abs(
+        endpoints[640]["endpoint_s"] - endpoints[320]["endpoint_s"]
+    )
+    if finest_grid_difference > 30.0:
+        raise RuntimeError(
+            f"Q3终点网格验收未通过：320到640区间差{finest_grid_difference:.3f} s"
+        )
+    if time_refinement["absolute_difference_s"].iloc[0] > 5.0:
+        raise RuntimeError("Q3时间积分收紧验收未通过")
+    if comparison["absolute_difference_s"].iloc[0] > 5.0:
+        raise RuntimeError("Q3 BDF与Radau终点复核未通过")
+    if max_before < 0.15 or max_strict >= 0.15:
+        raise RuntimeError("Q3首个严格60 s达标时刻判定未通过")
+    if radial_increment > 1e-7 or balance_relative > 0.002:
+        raise RuntimeError("Q3单调性或水分守恒验收未通过")
+
+    convergence.to_csv(validation_dir / "q3_grid_convergence.csv", index=False, encoding="utf-8-sig")
+    comparison.to_csv(validation_dir / "q3_bdf_radau_comparison.csv", index=False, encoding="utf-8-sig")
+    time_refinement.to_csv(validation_dir / "q3_time_refinement.csv", index=False, encoding="utf-8-sig")
+    sensitivity.to_csv(validation_dir / "q3_sensitivity.csv", index=False, encoding="utf-8-sig")
+    sensitivity_summary.to_csv(validation_dir / "q3_sensitivity_summary.csv", index=False, encoding="utf-8-sig")
+    summary.to_csv(validation_dir / "q3_validation_summary.csv", index=False, encoding="utf-8-sig")
+    return solution, convergence, comparison, time_refinement, sensitivity, summary
+
+
+def cumulative_shrinking_moisture_balance(solution, boundary):
+    time_s = solution["time_s"]
+    moisture = solution["moisture"]
+    _, _, material_volume, material_area = solution["unit_grid"]
+    mean_moisture = moisture @ material_volume / material_volume.sum()
+    _, air_moisture = boundary_values(
+        time_s, boundary, long_term_mode=solution["long_term_mode"]
+    )
+    outward_rate = (
+        material_area[-1]
+        * H_M
+        * solution["mass_transfer_scale"]
+        * (moisture[:, -1] - air_moisture)
+        / (solution["radius_at_time_m"] * material_volume.sum())
+    )
+    cumulative = np.zeros_like(time_s)
+    cumulative[1:] = np.cumsum(
+        0.5 * np.diff(time_s) * (outward_rate[:-1] + outward_rate[1:])
+    )
+    residual = mean_moisture - mean_moisture[0] + cumulative
+    relative = np.max(np.abs(residual)) / max(
+        abs(mean_moisture[0] - mean_moisture[-1]), 1e-12
+    )
+    return relative, residual[-1]
+
+
+def run_q4_validation(
+    boundary, radius_history, q3_solution=None, output_root=Path("outputs")
+):
+    validation_dir = output_root / "validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    endpoints = {
+        interval_count: solve_q4_endpoint(
+            boundary,
+            radius_history,
+            interval_count=interval_count,
+            max_step_s=300.0,
+        )
+        for interval_count in [80, 160, 320]
+    }
+    convergence = _endpoint_grid_frame(endpoints)
+    finest_endpoint = endpoints[320]
+    solution = solve_q4(
+        boundary,
+        radius_history,
+        interval_count=320,
+        endpoint=finest_endpoint,
+    )
+
+    radau = solve_q4_endpoint(
+        boundary,
+        radius_history,
+        interval_count=80,
+        method="Radau",
+        max_step_s=300.0,
+    )
+    comparison = pd.DataFrame(
+        [
+            {
+                "interval_count": 80,
+                "primary_method": "BDF",
+                "check_method": "Radau",
+                "bdf_endpoint_s": endpoints[80]["endpoint_s"],
+                "radau_endpoint_s": radau["endpoint_s"],
+                "absolute_difference_s": abs(
+                    endpoints[80]["endpoint_s"] - radau["endpoint_s"]
+                ),
+            }
+        ]
+    )
+    tightened = solve_q4_endpoint(
+        boundary,
+        radius_history,
+        interval_count=320,
+        max_step_s=150.0,
+        relative_tolerance=1e-8,
+        temperature_tolerance=1e-8,
+        moisture_tolerance=1e-10,
+    )
+    time_refinement = pd.DataFrame(
+        [
+            {
+                "interval_count": 320,
+                "baseline_endpoint_s": finest_endpoint["endpoint_s"],
+                "tightened_endpoint_s": tightened["endpoint_s"],
+                "absolute_difference_s": abs(
+                    finest_endpoint["endpoint_s"] - tightened["endpoint_s"]
+                ),
+            }
+        ]
+    )
+
+    shrinkage_rows = []
+    for shrinkage_scale in [0.9, 1.0, 1.1]:
+        endpoint = (
+            endpoints[160]
+            if shrinkage_scale == 1.0
+            else solve_q4_endpoint(
+                boundary,
+                radius_history,
+                interval_count=160,
+                max_step_s=300.0,
+                shrinkage_scale=shrinkage_scale,
+            )
+        )
+        shrinkage_rows.append(
+            {
+                "scenario": "shrinkage_scale",
+                "shrinkage_scale": shrinkage_scale,
+                "radius_method": "pchip",
+                "endpoint_s": endpoint["endpoint_s"],
+                "endpoint_h": endpoint["endpoint_s"] / 3600.0,
+                "endpoint_radius_cm": endpoint["endpoint_radius_m"] * 100.0,
+            }
+        )
+    linear_endpoint = solve_q4_endpoint(
+        boundary,
+        radius_history,
+        interval_count=160,
+        max_step_s=300.0,
+        radius_method="linear",
+    )
+    shrinkage_rows.append(
+        {
+            "scenario": "radius_interpolation",
+            "shrinkage_scale": 1.0,
+            "radius_method": "linear",
+            "endpoint_s": linear_endpoint["endpoint_s"],
+            "endpoint_h": linear_endpoint["endpoint_s"] / 3600.0,
+            "endpoint_radius_cm": linear_endpoint["endpoint_radius_m"] * 100.0,
+        }
+    )
+    sensitivity = pd.DataFrame(shrinkage_rows)
+    sensitivity["delta_from_baseline_h"] = (
+        sensitivity["endpoint_s"] - endpoints[160]["endpoint_s"]
+    ) / 3600.0
+
+    fixed_q4 = solve_q4_endpoint(
+        boundary,
+        radius_history,
+        interval_count=320,
+        max_step_s=300.0,
+        fixed_radius_m=RADIUS_M,
+    )
+    if q3_solution is None:
+        q3_endpoint_s = solve_q3_endpoint(
+            boundary, interval_count=640, max_step_s=300.0
+        )["endpoint_s"]
+    else:
+        q3_endpoint_s = q3_solution["endpoint_s"]
+    decomposition = pd.DataFrame(
+        [
+            {"case": "P3_fixed_radius", "endpoint_s": q3_endpoint_s},
+            {"case": "P4_fixed_radius", "endpoint_s": fixed_q4["endpoint_s"]},
+            {"case": "P4_shrinking_radius", "endpoint_s": finest_endpoint["endpoint_s"]},
+        ]
+    )
+    decomposition["endpoint_h"] = decomposition["endpoint_s"] / 3600.0
+    decomposition["delta_from_P3_fixed_h"] = (
+        decomposition["endpoint_s"] - q3_endpoint_s
+    ) / 3600.0
+
+    dense_time = np.arange(
+        0.0, radius_history["time_s"][-1] + 1.0, 60.0
+    )
+    dense_radius = radius_values(dense_time, radius_history, method="pchip")
+    radius_node_error = np.max(
+        np.abs(
+            radius_values(radius_history["time_s"], radius_history, method="pchip")
+            - radius_history["radius_m"]
+        )
+    )
+    radius_increment = np.max(np.diff(dense_radius))
+
+    unit_grid = build_radial_grid(40, radius_m=1.0, surface_refinement=1.5)
+    physical_grid = scale_material_grid(unit_grid, RADIUS_M)
+    node_count = len(unit_grid[0])
+    test_temperature = np.linspace(40.0, 48.0, node_count)
+    test_moisture = np.linspace(1.2, 0.6, node_count)
+    test_state = np.concatenate([test_temperature, test_moisture])
+    dynamic_rate = q4_rhs(
+        18000.0,
+        test_state,
+        boundary,
+        unit_grid,
+        radius_history,
+        "pchip",
+        1.0,
+        RADIUS_M,
+        1.0,
+        1.0,
+        "rounded",
+    )
+    air_temperature, air_moisture = boundary_values(18000.0, boundary)
+    density, heat_capacity, conductivity, diffusivity = properties_q4(
+        test_temperature, test_moisture
+    )
+    reference_rate = np.concatenate(
+        [
+            radial_rate(
+                test_temperature,
+                conductivity,
+                density * heat_capacity,
+                air_temperature,
+                H_T,
+                physical_grid,
+            ),
+            radial_rate(
+                test_moisture,
+                diffusivity,
+                1.0,
+                air_moisture,
+                H_M,
+                physical_grid,
+            ),
+        ]
+    )
+    fixed_domain_rate_error = np.max(np.abs(dynamic_rate - reference_rate))
+
+    artificial_boundary = {
+        "time_s": np.array([0.0, 60.0]),
+        "air_temperature_c": np.array([28.0, 28.0]),
+        "air_moisture": np.array([INITIAL_MOISTURE, INITIAL_MOISTURE]),
+    }
+    uniform_state = np.concatenate(
+        [np.full(node_count, 28.0), np.full(node_count, INITIAL_MOISTURE)]
+    )
+    uniform_rate = q4_rhs(
+        0.0,
+        uniform_state,
+        artificial_boundary,
+        unit_grid,
+        radius_history,
+        "pchip",
+        1.0,
+        RADIUS_M,
+        1.0,
+        1.0,
+        "rounded",
+    )
+
+    balance_relative, balance_final = cumulative_shrinking_moisture_balance(
+        solution, boundary
+    )
+    max_before = np.max(solution["moisture"][-2])
+    max_strict = np.max(solution["moisture"][-1])
+    endpoint_index = int(np.argmax(solution["endpoint_moisture"]))
+    radial_increment = np.max(np.diff(solution["moisture"], axis=1))
+    density, heat_capacity, conductivity, diffusivity = properties_q4(
+        solution["temperature_c"], solution["moisture"]
+    )
+    summary = pd.DataFrame(
+        [
+            {"check": "continuous_endpoint", "value": solution["endpoint_s"], "unit": "s"},
+            {"check": "continuous_endpoint", "value": solution["endpoint_s"] / 3600.0, "unit": "h"},
+            {"check": "strict_60s_endpoint", "value": solution["strict_output_s"], "unit": "s"},
+            {"check": "endpoint_radius", "value": solution["endpoint_radius_m"] * 100.0, "unit": "cm"},
+            {"check": "maximum_moisture_before_strict", "value": max_before, "unit": "kg/kg"},
+            {"check": "maximum_moisture_at_strict", "value": max_strict, "unit": "kg/kg"},
+            {"check": "endpoint_control_material_coordinate", "value": solution["material_coordinate"][endpoint_index], "unit": "1"},
+            {"check": "maximum_radial_moisture_increment", "value": radial_increment, "unit": "kg/kg"},
+            {"check": "cumulative_moisture_balance_relative", "value": balance_relative, "unit": "1"},
+            {"check": "cumulative_moisture_balance_final", "value": balance_final, "unit": "kg/kg"},
+            {"check": "radius_node_interpolation_error", "value": radius_node_error, "unit": "m"},
+            {"check": "maximum_radius_increment", "value": radius_increment, "unit": "m"},
+            {"check": "fixed_radius_rate_max_difference", "value": fixed_domain_rate_error, "unit": "state/s"},
+            {"check": "uniform_field_rhs_max", "value": np.max(np.abs(uniform_rate)), "unit": "state/s"},
+            {"check": "minimum_density", "value": density.min(), "unit": "kg/m3"},
+            {"check": "minimum_heat_capacity", "value": heat_capacity.min(), "unit": "J/(kg K)"},
+            {"check": "minimum_conductivity", "value": conductivity.min(), "unit": "W/(m K)"},
+            {"check": "minimum_diffusivity", "value": diffusivity.min(), "unit": "m2/s"},
+        ]
+    )
+
+    finest_grid_difference = abs(
+        endpoints[320]["endpoint_s"] - endpoints[160]["endpoint_s"]
+    )
+    if finest_grid_difference > 30.0:
+        raise RuntimeError(
+            f"Q4终点网格验收未通过：160到320区间差{finest_grid_difference:.3f} s"
+        )
+    if time_refinement["absolute_difference_s"].iloc[0] > 5.0:
+        raise RuntimeError("Q4时间积分收紧验收未通过")
+    if comparison["absolute_difference_s"].iloc[0] > 5.0:
+        raise RuntimeError("Q4 BDF与Radau终点复核未通过")
+    if max_before < 0.15 or max_strict >= 0.15:
+        raise RuntimeError("Q4首个严格60 s达标时刻判定未通过")
+    if radial_increment > 1e-7 or balance_relative > 0.002:
+        raise RuntimeError("Q4单调性或水分守恒验收未通过")
+    if radius_node_error > 1e-12 or radius_increment > 1e-12:
+        raise RuntimeError("Q4半径PCHIP插值验收未通过")
+    if fixed_domain_rate_error > 1e-12 or np.max(np.abs(uniform_rate)) > 1e-12:
+        raise RuntimeError("Q4固定半径退化或均匀场验收未通过")
+
+    convergence.to_csv(validation_dir / "q4_grid_convergence.csv", index=False, encoding="utf-8-sig")
+    comparison.to_csv(validation_dir / "q4_bdf_radau_comparison.csv", index=False, encoding="utf-8-sig")
+    time_refinement.to_csv(validation_dir / "q4_time_refinement.csv", index=False, encoding="utf-8-sig")
+    sensitivity.to_csv(validation_dir / "q4_shrinkage_sensitivity.csv", index=False, encoding="utf-8-sig")
+    decomposition.to_csv(validation_dir / "q4_effect_decomposition.csv", index=False, encoding="utf-8-sig")
+    summary.to_csv(validation_dir / "q4_validation_summary.csv", index=False, encoding="utf-8-sig")
+    return (
+        solution,
+        convergence,
+        comparison,
+        time_refinement,
+        sensitivity,
+        decomposition,
+        summary,
+    )
