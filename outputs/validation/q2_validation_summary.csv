@@ -1,0 +1,13 @@
+﻿check,value,unit
+uniform_field_rhs_max,0.0,state/s
+minimum_temperature,28.0,℃
+maximum_temperature,49.96642776736307,℃
+minimum_moisture,1.0081217573568035,kg/kg
+maximum_moisture,2.5500000000000003,kg/kg
+minimum_density,779.0395849416709,kg/m3
+minimum_heat_capacity,2823.5328139458693,J/(kg K)
+minimum_conductivity,0.40076844638137077,W/(m K)
+minimum_diffusivity,5.547394485223674e-09,m2/s
+maximum_diffusivity,1.2521866296196632e-08,m2/s
+minimum_radial_temperature_increment,-0.0002962841512115233,℃
+maximum_radial_moisture_increment,1.3322676295501878e-15,kg/kg

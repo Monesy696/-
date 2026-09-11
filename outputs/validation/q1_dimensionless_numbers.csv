@@ -1,0 +1,8 @@
+﻿quantity,value,unit
+thermal_diffusivity,1.6885553470919323e-07,m2/s
+initial_moisture_diffusivity,4.937655094173937e-09,m2/s
+thermal_characteristic_time,0.6580246913580248,h
+moisture_characteristic_time,22.50280932789613,h
+thermal_Fourier_number_1800s,0.7598499061913695,1
+moisture_Fourier_number_1800s,0.022219447923782717,1
+thermal_to_moisture_diffusivity_ratio,34.1975151136883,1
